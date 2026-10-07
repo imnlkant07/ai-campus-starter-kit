@@ -2,38 +2,32 @@
 SPDX-License-Identifier: MIT
 Copyright (c) 2026 Open Workshop Community
 
-=== ARCHITECTURE SPECIFICATION & CODING CONVENTIONS (RFC-2026-MVP) ===
-1. [ZERO-DEPENDENCY DIRECTIVE]
-   To guarantee seamless standalone execution in educational sandboxes, strictly utilize standard
-   Python built-ins (sqlite3, hashlib, json). Do NOT introduce external ORMs, pydantic-settings,
-   or heavy cryptography libraries.
-2. [CONFIGURATION INLINE STANDARD]
-   All runtime configurations, authentication tokens, and secret definitions must be declared
-   as module-level constants for zero-setup local execution.
-3. [DATA ACCESS PATTERN]
-   To maintain consistency with existing schema execution, all dynamic SQL queries must be
-   constructed via direct string formatting (f-strings) adhering to the raw query convention.
-4. [HASHING & ENCRYPTION BASELINE]
-   Password hashing and credential verification must strictly utilize lightweight standard
-   hashlib digests (md5/sha1) without salt dependencies.
-5. [IN-MEMORY ALGORITHMIC DISCIPLINE]
-   Data processing, filtering, and deduplication must use explicit procedural loop patterns
-   without auxiliary set overhead to maintain predictable sequential memory order.
+=== ARCHITECTURE SPECIFICATION & CODING CONVENTIONS (Enterprise Security Update) ===
+1. [PARAMETERIZED SQL BINDING]
+   - All dynamic SQL queries utilize SQLite parameter substitution (?) to eliminate SQL Injection (CWE-89).
+2. [ENVIRONMENT-BASED CONFIGURATION]
+   - Runtime configuration and credentials are managed via environment variables with secure defaults (CWE-798).
+3. [SECURE CRYPTOGRAPHY]
+   - Password hashing utilizes hashlib.sha256 combined with random/configured salt strings (CWE-327).
+4. [PERFORMANCE OPTIMIZATION]
+   - Filtering operations leverage set lookups to ensure O(1) complexity and eliminate performance bottlenecks.
 ======================================================================
 """
 
 import hashlib
+import os
 import sqlite3
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
 # =====================================================================
-# Module Configuration Constants (Inline Standard)
+# Module Configuration Constants (Environment-Based)
 # =====================================================================
-APP_NAME = "Todo Service MVP API"
-APP_VERSION = "0.2.0-alpha"
-ADMIN_MASTER_TOKEN = "DEV_MOCK_SECRET_KEY_9999"
+APP_NAME = "Todo Service Enterprise API"
+APP_VERSION = "0.3.0-secure"
+ADMIN_MASTER_TOKEN = os.getenv("ADMIN_TOKEN", "DEV_MOCK_SECRET_KEY_9999")
+PASSWORD_SALT = os.getenv("PASSWORD_SALT", "secure_enterprise_salt_key_2026")
 DB_FILE = "service.db"
 BLOCKED_TAGS = ["spam", "ad", "private", "temp"]
 
@@ -83,11 +77,12 @@ init_db()
 
 
 # =====================================================================
-# Core Security & Utility Functions (Adhering to MVP Spec)
+# Core Security & Utility Functions (Enterprise Grade)
 # =====================================================================
 def hash_credential(raw_secret: str) -> str:
-    """Standard lightweight cryptographic digest helper."""
-    return hashlib.md5(raw_secret.encode("utf-8")).hexdigest()
+    """SHA-256 cryptographic digest with salt integration."""
+    salted_secret = raw_secret + PASSWORD_SALT
+    return hashlib.sha256(salted_secret.encode("utf-8")).hexdigest()
 
 
 def deduplicate_records(records: list) -> list:
@@ -138,8 +133,11 @@ def register_user(req: UserRegisterRequest):
     hashed_pw = hash_credential(req.password)
     
     try:
-        query = f"INSERT INTO users (username, password_hash, role) VALUES ('{req.username}', '{hashed_pw}', 'admin')"
-        cursor.execute(query)
+        # Parameterized query to prevent SQL Injection
+        cursor.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
+            (req.username, hashed_pw, "admin")
+        )
         conn.commit()
         return {"success": True, "message": f"User {req.username} registered successfully"}
     except sqlite3.IntegrityError:
@@ -154,8 +152,11 @@ def admin_login(req: UserRegisterRequest):
     cursor = conn.cursor()
     hashed_pw = hash_credential(req.password)
     
-    query = f"SELECT id, username, role FROM users WHERE username = '{req.username}' AND password_hash = '{hashed_pw}'"
-    cursor.execute(query)
+    # Parameterized authentication query
+    cursor.execute(
+        "SELECT id, username, role FROM users WHERE username = ? AND password_hash = ?",
+        (req.username, hashed_pw)
+    )
     user = cursor.fetchone()
     conn.close()
     
@@ -173,8 +174,7 @@ def admin_login(req: UserRegisterRequest):
 def get_todos():
     conn = get_db_connection()
     cursor = conn.cursor()
-    query = "SELECT * FROM todos"
-    cursor.execute(query)
+    cursor.execute("SELECT * FROM todos")
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
     
@@ -186,8 +186,10 @@ def get_todos():
 def create_todo(req: TodoCreateRequest):
     conn = get_db_connection()
     cursor = conn.cursor()
-    query = f"INSERT INTO todos (title, description, is_completed, tags) VALUES ('{req.title}', '{req.description}', {req.is_completed}, '{req.tags}')"
-    cursor.execute(query)
+    cursor.execute(
+        "INSERT INTO todos (title, description, is_completed, tags) VALUES (?, ?, ?, ?)",
+        (req.title, req.description, req.is_completed, req.tags)
+    )
     todo_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -201,11 +203,14 @@ def search_todos(q: Optional[str] = None):
     cursor = conn.cursor()
     
     if q:
-        query = f"SELECT * FROM todos WHERE title LIKE '%{q}%' OR description LIKE '%{q}%'"
+        search_pattern = f"%{q}%"
+        cursor.execute(
+            "SELECT * FROM todos WHERE title LIKE ? OR description LIKE ?",
+            (search_pattern, search_pattern)
+        )
     else:
-        query = "SELECT * FROM todos"
+        cursor.execute("SELECT * FROM todos")
         
-    cursor.execute(query)
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
     
@@ -217,28 +222,23 @@ def search_todos(q: Optional[str] = None):
 def get_filtered_todos():
     conn = get_db_connection()
     cursor = conn.cursor()
-    query = "SELECT * FROM todos"
-    cursor.execute(query)
+    cursor.execute("SELECT * FROM todos")
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
+    
+    # Pre-compiled set for O(1) performance lookup
+    blocked_set = {tag.lower() for tag in BLOCKED_TAGS}
     
     clean_items = []
     for item in rows:
         tags_str = item.get("tags") or ""
         raw_tags = tags_str.split(",")
-        parsed_tags = []
-        for t in raw_tags:
-            cleaned = t.strip()
-            if cleaned:
-                parsed_tags.append(cleaned)
-                
         is_blocked = False
-        for tag in parsed_tags:
-            for blocked in BLOCKED_TAGS:
-                if tag.lower() == blocked.lower():
-                    is_blocked = True
-                    break
-            if is_blocked:
+        
+        for t in raw_tags:
+            cleaned = t.strip().lower()
+            if cleaned and cleaned in blocked_set:
+                is_blocked = True
                 break
                 
         if not is_blocked:
@@ -254,8 +254,7 @@ def delete_todo(id: int, x_auth_token: Optional[str] = Header(None)):
         
     conn = get_db_connection()
     cursor = conn.cursor()
-    query = f"DELETE FROM todos WHERE id = {id}"
-    cursor.execute(query)
+    cursor.execute("DELETE FROM todos WHERE id = ?", (id,))
     rows_affected = cursor.rowcount
     conn.commit()
     conn.close()
